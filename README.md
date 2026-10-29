@@ -24,6 +24,14 @@ HTTP, `bun:sqlite`-free JSON persistence, `pbkdf2_sha512` for passwords, and
 
 ---
 
+## See it running
+
+A live instance with demo data is at
+[`a12127ad908120d7b.apps.workbuddy.host`](https://a12127ad908120d7b.apps.workbuddy.host/?sharecode=XEP4TCDWAO)
+— sign in as `ravi@example.com` / `bamboo12345`, or as the admin at `/admin`
+with `admin@localhost` / `bamboo-admin`. Its upstream is a mock, so answers come
+back as `echo: …`; the billing, streaming and console are real.
+
 ## Run it
 
 ```bash
