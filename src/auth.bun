@@ -1,0 +1,234 @@
+// src/auth.bun — two kinds of caller.
+//
+//   an API key   a customer's program, sent as a bearer token
+//   a session    a person in the console, sent as a cookie
+//
+// An API key is stored as a SHA-256 hash: the console shows the secret once,
+// at creation, and can never show it again.
+
+import { CONFIG } from "./config.bun"
+import { store_data, store_save, store_mutate, store_all, store_find, store_where, store_by_id, store_insert, store_remove, store_setting, store_set_setting, store_trim_usage } from "./store.bun"
+import { crypto_hex_of, crypto_random_hex, crypto_uuid, crypto_new_api_key, crypto_hash_key, crypto_key_prefix, crypto_hash_password, crypto_verify_password, crypto_hex_to_bytes, crypto_same_secret, crypto_token } from "./crypto.bun"
+
+export let auth_USER_COOKIE = "bk_session"
+export let auth_ADMIN_COOKIE = "bk_admin"
+
+fn secret_from(req) {
+    let headers = req["headers"]
+    // `x-api-key` comes first on purpose: a hosting proxy in front of the
+    // gateway may put its own `Authorization` header on the request, and a
+    // gateway key that arrives in `Authorization` is only trusted when it
+    // actually looks like one.
+    if headers.has("x-api-key") {
+        let value = headers.get("x-api-key").trim()
+        if value != "" {
+            return value
+        }
+    }
+    if headers.has("authorization") {
+        let parts = headers.get("authorization").split(" ")
+        if len(parts) >= 2 and parts[0].lower() == "bearer" {
+            let token = parts[1].trim()
+            if token.starts_with("bk_live_") or token.starts_with("bk_test_") {
+                return token
+            }
+        }
+    }
+    // Last resort for environments whose proxy drops the auth headers
+    // (a hosted preview does exactly that): `?key=bk_live_...` in the URL.
+    if req.has("query") {
+        let query = req["query"]
+        for name in ["key", "api_key"] {
+            if query.has(name) {
+                let value = str(query.get(name)).trim()
+                if value != "" {
+                    return value
+                }
+            }
+        }
+    }
+    return null
+}
+
+export fn auth_api_key(req) {
+    return secret_from(req)
+}
+
+// The full check for a gateway call.
+export fn auth_authenticate(req) {
+    let secret = secret_from(req)
+    if secret == null {
+        return {
+            "ok": false,
+            "status": 401,
+            "message": "Missing API key. Send 'Authorization: Bearer bk_live_...' or 'x-api-key'."
+        }
+    }
+    let hashed = crypto_hash_key(secret)
+    let key = store_find("keys", fn (item) {
+        return item["hash"] == hashed
+    })
+    if key == null {
+        return { "ok": false, "status": 401, "message": "Invalid API key." }
+    }
+    if key["status"] != "active" {
+        return { "ok": false, "status": 403, "message": "This API key is revoked." }
+    }
+    let user = store_by_id("users", key["user_id"])
+    if user == null {
+        return { "ok": false, "status": 403, "message": "The account for this key no longer exists." }
+    }
+    if user["status"] == "suspended" {
+        return { "ok": false, "status": 403, "message": "This account is suspended." }
+    }
+    return { "ok": true, "key": key, "user": user }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+export fn auth_cookies(req) {
+    let out = {}
+    if !req["headers"].has("cookie") {
+        return out
+    }
+    for part in req["headers"].get("cookie").split(";") {
+        let mark = part.index_of("=")
+        if mark > 0 {
+            out[part.slice(0, mark).trim()] = url_decode(part.slice(mark + 1, part.len()).trim())
+        }
+    }
+    return out
+}
+
+export fn auth_create_session(user_id, kind) {
+    let seconds = CONFIG["session_days"] * 86400
+    let session = {
+        "id": crypto_token(24),
+        "user_id": user_id,
+        "kind": kind,
+        "created_at": now(),
+        "expires_at": now() + seconds
+    }
+    store_insert("sessions", session)
+    return session
+}
+
+export fn auth_destroy_session(session_id) {
+    if session_id == null {
+        return null
+    }
+    return store_remove("sessions", session_id)
+}
+
+fn live_session(id, kind) {
+    if id == null or id == "" {
+        return null
+    }
+    let session = store_by_id("sessions", id)
+    if session == null {
+        return null
+    }
+    if session["kind"] != kind {
+        return null
+    }
+    if session["expires_at"] <= now() {
+        store_remove("sessions", id)
+        return null
+    }
+    return session
+}
+
+export fn auth_session_user(req) {
+    let jar = auth_cookies(req)
+    let session = live_session(jar.get(auth_USER_COOKIE), "user")
+    if session == null {
+        return null
+    }
+    let user = store_by_id("users", session["user_id"])
+    if user == null or user["status"] == "suspended" {
+        return null
+    }
+    return user
+}
+
+export fn auth_session_admin(req) {
+    let jar = auth_cookies(req)
+    let session = live_session(jar.get(auth_ADMIN_COOKIE), "admin")
+    if session == null {
+        return null
+    }
+    return store_by_id("admins", session["user_id"])
+}
+
+// ---------------------------------------------------------------------------
+// Passwords
+// ---------------------------------------------------------------------------
+
+export fn auth_register(name, email, password) {
+    let clean_email = email.trim().lower()
+    if len(clean_email) < 5 or !clean_email.contains("@") {
+        return { "ok": false, "message": "Enter a valid email address." }
+    }
+    if len(password) < 8 {
+        return { "ok": false, "message": "Use at least 8 characters for the password." }
+    }
+    let existing = store_find("users", fn (item) {
+        return item["email"] == clean_email
+    })
+    if existing != null {
+        return { "ok": false, "message": "An account with this email already exists." }
+    }
+    let user = {
+        "id": "usr_" + crypto_random_hex(8),
+        "name": name.trim(),
+        "email": clean_email,
+        "password": crypto_hash_password(password),
+        "status": "active",
+        "balance_micros": 0,
+        "reserved_micros": 0,
+        "free_tokens": CONFIG["free_monthly_tokens"],
+        "free_reset_at": now() + 30 * 86400,
+        "rpm_limit": CONFIG["default_rpm"],
+        "created_at": now(),
+        "last_seen_at": now()
+    }
+    store_insert("users", user)
+    return { "ok": true, "user": user }
+}
+
+export fn auth_login(email, password) {
+    let clean_email = email.trim().lower()
+    let user = store_find("users", fn (item) {
+        return item["email"] == clean_email
+    })
+    if user == null {
+        return { "ok": false, "message": "No account with that email." }
+    }
+    if !crypto_verify_password(password, user["password"]) {
+        return { "ok": false, "message": "That password does not match." }
+    }
+    if user["status"] == "suspended" {
+        return { "ok": false, "message": "This account is suspended." }
+    }
+    store_mutate(fn (doc) {
+        user["last_seen_at"] = now()
+        return null
+    })
+    return { "ok": true, "user": user }
+}
+
+export fn auth_login_admin(email, password) {
+    let clean_email = email.trim().lower()
+    let admin = store_find("admins", fn (item) {
+        return item["email"] == clean_email
+    })
+    if admin == null {
+        return { "ok": false, "message": "No admin with that email." }
+    }
+    if !crypto_verify_password(password, admin["password"]) {
+        return { "ok": false, "message": "That password does not match." }
+    }
+    return { "ok": true, "admin": admin }
+}

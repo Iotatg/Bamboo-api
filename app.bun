@@ -1,0 +1,109 @@
+// app.bun — Bamboo-api.
+//
+// A multi-protocol AI gateway on the Bun language: one upstream key, three
+// wire protocols, a wallet billed per token, and a console that shows every
+// number the gateway charges.
+//
+//   bun app.bun
+//
+// The language runtime is the `bun` package from github.com/Iotatg/Bun.
+
+import { http_reason, http_listen, http_serve_forever, http_json, http_html, http_text, http_redirect, http_stream_response } from "./src/http.bun"
+import { router_create, router_add, router_get, router_post, router_patch, router_delete_route, router_match } from "./src/router.bun"
+import { gateway_resolve_model, gateway_register } from "./src/gateway.bun"
+import { console_register } from "./src/console.bun"
+import { seed_ensure } from "./src/seed.bun"
+import { CONFIG } from "./src/config.bun"
+
+seed_ensure()
+
+let ROUTER = router_create()
+gateway_register(ROUTER)
+console_register(ROUTER)
+
+fn cors_headers(origin) {
+    var allow = "*"
+    if origin != null and origin != "" {
+        allow = origin
+    }
+    return {
+        "Access-Control-Allow-Origin": allow,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, x-api-key, anthropic-version, openai-organization, openai-project",
+        "Access-Control-Max-Age": "86400"
+    }
+}
+
+fn apply_cors(response, origin) {
+    let headers = cors_headers(origin)
+    for key in headers.keys() {
+        response["headers"][key] = headers.get(key)
+    }
+    return response
+}
+
+fn not_found() {
+    return http_json(404, {
+        "error": {
+            "message": "No route matches this path. The gateway lives under /v1; the console lives at /dashboard.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "not_found"
+        }
+    })
+}
+
+fn handle(req) {
+    let path = req["path"]
+    let is_api = path == "/v1" or path.starts_with("/v1/")
+
+    if is_api and req["method"] == "OPTIONS" {
+        let response = { "status": 204, "headers": {}, "body": "" }
+        return apply_cors(response, req["headers"].get("origin"))
+    }
+
+    let found = router_match(ROUTER, req["method"], path)
+    if found == null {
+        let response = not_found()
+        if is_api {
+            return apply_cors(response, req["headers"].get("origin"))
+        }
+        return response
+    }
+    if found.has("method_not_allowed") {
+        let response = http_json(405, {
+            "error": { "message": "Method not allowed on " + path + ".", "type": "invalid_request_error" }
+        })
+        response["headers"]["Allow"] = found["allowed"].join(", ")
+        return response
+    }
+
+    req["params"] = found["params"]
+    var response = null
+    try {
+        response = found["handler"](req)
+    } catch err {
+        print("[app] " + path + " failed: " + str(err))
+        response = http_json(500, {
+            "error": { "message": "The gateway failed to handle this request.", "type": "server_error" }
+        })
+    }
+    if response == null {
+        response = not_found()
+    }
+    if is_api {
+        return apply_cors(response, req["headers"].get("origin"))
+    }
+    return response
+}
+
+let SERVER = http_listen(CONFIG["host"], CONFIG["port"])
+print("")
+print("  Bamboo-api")
+print("  console   http://localhost:" + str(SERVER["port"]) + "/dashboard")
+print("  admin     http://localhost:" + str(SERVER["port"]) + "/admin")
+print("  gateway   http://localhost:" + str(SERVER["port"]) + "/v1")
+print("  upstream  " + str(CONFIG["upstream_base_url"]))
+print("")
+
+http_serve_forever(SERVER, handle)

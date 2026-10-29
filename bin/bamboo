@@ -1,0 +1,26 @@
+#!/usr/bin/env sh
+# Run a Bun-language program with the runtime from github.com/Iotatg/Bun.
+#
+#   ./bin/bamboo app.bun
+#
+# The runtime is a Python package; set BUN_LANG_HOME to the checkout that
+# contains the `bun` package and the `lib/bun` standard library.
+
+set -e
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The runtime is vendored under vendor/ for a self-contained deploy; a real
+# BUN_LANG_HOME in the environment still wins, and a sibling checkout of
+# github.com/Iotatg/Bun is used when there is no vendored copy.
+: "${BUN_LANG_HOME:=$ROOT/vendor}"
+if [ ! -d "$BUN_LANG_HOME/bun" ] && [ -d "$ROOT/../Bun/bun/bun" ]; then
+  BUN_LANG_HOME="$ROOT/../Bun/bun"
+fi
+
+if [ ! -d "$BUN_LANG_HOME/bun" ]; then
+  echo "bamboo: cannot find the Bun language runtime at $BUN_LANG_HOME" >&2
+  echo "        clone https://github.com/Iotatg/Bun and set BUN_LANG_HOME to <checkout>/bun" >&2
+  exit 1
+fi
+
+PYTHONPATH="$BUN_LANG_HOME${PYTHONPATH:+:$PYTHONPATH}" PYTHONUNBUFFERED=1 exec python3 -m bun "$@"

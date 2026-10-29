@@ -1,0 +1,414 @@
+// src/http.bun — an HTTP/1.1 server on raw sockets.
+//
+// The language ships bun:web, but its `chunked()` sends every piece at once.
+// A gateway has to forward an SSE stream while it arrives, so this module
+// owns the socket: it parses the request, keeps the connection alive, and
+// hands the handler a `write` function for streamed answers.
+//
+// A request is a dict:
+//   method, path, query, headers, body, peer
+//
+// A response is a dict:
+//   status, headers, body            — an ordinary answer
+//   status, headers, stream: fn(w)   — a chunked answer, written as it comes
+
+let CRLF = "\r\n"
+
+let REASONS = {
+    "200": "OK",
+    "201": "Created",
+    "204": "No Content",
+    "301": "Moved Permanently",
+    "302": "Found",
+    "304": "Not Modified",
+    "400": "Bad Request",
+    "401": "Unauthorized",
+    "403": "Forbidden",
+    "404": "Not Found",
+    "405": "Method Not Allowed",
+    "409": "Conflict",
+    "413": "Payload Too Large",
+    "415": "Unsupported Media Type",
+    "422": "Unprocessable Entity",
+    "429": "Too Many Requests",
+    "500": "Internal Server Error",
+    "502": "Bad Gateway",
+    "503": "Service Unavailable",
+    "504": "Gateway Timeout"
+}
+
+let HEX = "0123456789abcdef"
+
+export fn http_reason(status) {
+    let key = str(status)
+    if REASONS.has(key) {
+        return REASONS.get(key)
+    }
+    return "Unknown"
+}
+
+fn hex_of(number) {
+    if number == 0 {
+        return "0"
+    }
+    var value = number
+    var out = ""
+    while value > 0 {
+        let digit = value % 16
+        out = HEX[digit] + out
+        value = value / 16
+    }
+    return out
+}
+
+// A chunk of the chunked encoding: the length in hex, the bytes, a blank line.
+fn chunk_frame(text) {
+    let data = utf8_bytes(text)
+    var frame = utf8_bytes(hex_of(len(data)) + CRLF)
+    for byte in data {
+        frame.push(byte)
+    }
+    frame.push(13)
+    frame.push(10)
+    return frame
+}
+
+fn index_of_bytes(hay, needle, start_at) {
+    let limit = len(hay) - len(needle)
+    var i = start_at
+    while i <= limit {
+        var same = true
+        var j = 0
+        while j < len(needle) {
+            if hay[i + j] != needle[j] {
+                same = false
+                j = len(needle)
+            } else {
+                j = j + 1
+            }
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn parse_query(text) {
+    let result = {}
+    if text == "" {
+        return result
+    }
+    for part in text.split("&") {
+        if part == "" {
+            continue
+        }
+        let mark = part.index_of("=")
+        if mark < 0 {
+            result[url_decode(part)] = ""
+        } else {
+            let name = url_decode(part.slice(0, mark))
+            let value = url_decode(part.slice(mark + 1, part.len()))
+            result[name] = value
+        }
+    }
+    return result
+}
+
+fn parse_head(head) {
+    let lines = head.split(CRLF)
+    if len(lines) == 0 {
+        return null
+    }
+    let start = lines[0].split(" ")
+    if len(start) < 2 {
+        return null
+    }
+    let method = start[0].upper()
+    let target = start[1]
+    let mark = target.index_of("?")
+    var path = target
+    var query_text = ""
+    if mark >= 0 {
+        path = target.slice(0, mark)
+        query_text = target.slice(mark + 1, target.len())
+    }
+    let headers = {}
+    var i = 1
+    while i < len(lines) {
+        let line = lines[i]
+        if line != "" {
+            let colon = line.index_of(":")
+            if colon > 0 {
+                let name = line.slice(0, colon).trim().lower()
+                let value = line.slice(colon + 1, line.len()).trim()
+                headers[name] = value
+            }
+        }
+        i = i + 1
+    }
+    return {
+        "method": method,
+        "path": path,
+        "query": parse_query(query_text),
+        "headers": headers
+    }
+}
+
+fn read_request(conn, buffer) {
+    let marker = utf8_bytes(CRLF + CRLF)
+    var head_end = index_of_bytes(buffer, marker, 0)
+    while head_end < 0 {
+        let chunk = tcp_read(conn, 65536)
+        if len(chunk) == 0 {
+            return null
+        }
+        for byte in chunk {
+            buffer.push(byte)
+        }
+        head_end = index_of_bytes(buffer, marker, 0)
+        if head_end < 0 and len(buffer) > 1048576 {
+            return null
+        }
+    }
+    let head = utf8_string(buffer.slice(0, head_end))
+    let parsed = parse_head(head)
+    if parsed == null {
+        return null
+    }
+    var length = 0
+    if parsed["headers"].has("content-length") {
+        length = int(parsed["headers"].get("content-length"))
+        if length < 0 {
+            length = 0
+        }
+    }
+    let body_start = head_end + 4
+    while len(buffer) - body_start < length {
+        let chunk = tcp_read(conn, 65536)
+        if len(chunk) == 0 {
+            break
+        }
+        for byte in chunk {
+            buffer.push(byte)
+        }
+    }
+    let body = utf8_string(buffer.slice(body_start, body_start + length))
+    var rest = []
+    var index = body_start + length
+    while index < len(buffer) {
+        rest.push(buffer[index])
+        index = index + 1
+    }
+    return { "parsed": parsed, "body": body, "rest": rest }
+}
+
+fn build_head(status, headers, chunked) {
+    var out = "HTTP/1.1 " + str(status) + " " + http_reason(status) + CRLF
+    var has_type = false
+    var has_length = false
+    for key in headers.keys() {
+        let name = key.lower()
+        if name == "content-type" {
+            has_type = true
+        }
+        if name == "content-length" {
+            has_length = true
+        }
+        if name == "transfer-encoding" {
+            continue
+        }
+        out = out + key + ": " + str(headers.get(key)) + CRLF
+    }
+    if !has_type {
+        out = out + "Content-Type: text/plain; charset=utf-8" + CRLF
+    }
+    if chunked {
+        out = out + "Transfer-Encoding: chunked" + CRLF
+    }
+    if !chunked and !has_length {
+        out = out + "Content-Length: 0" + CRLF
+    }
+    out = out + "X-Content-Type-Options: nosniff" + CRLF
+    out = out + "Referrer-Policy: same-origin" + CRLF
+    return out
+}
+
+fn serve_connection(conn, handler) {
+    var buffer = []
+    while true {
+        let request = read_request(conn, buffer)
+        if request == null {
+            tcp_close(conn)
+            return
+        }
+        buffer = request["rest"]
+        let parsed = request["parsed"]
+        let req = {
+            "method": parsed["method"],
+            "path": parsed["path"],
+            "query": parsed["query"],
+            "headers": parsed["headers"],
+            "body": request["body"],
+            "peer": conn.get("peer")
+        }
+
+        var response = null
+        try {
+            response = handler(req)
+        } catch err {
+            print("[http] handler failed: " + str(err))
+            response = {
+                "status": 500,
+                "headers": { "Content-Type": "application/json" },
+                "body": json_stringify({ "error": { "message": "internal error", "type": "server_error" } })
+            }
+        }
+        if response == null {
+            response = { "status": 404, "headers": {}, "body": "not found" }
+        }
+
+        var headers = {}
+        if response.has("headers") {
+            headers = response["headers"]
+        }
+        var status = 200
+        if response.has("status") {
+            status = response["status"]
+        }
+
+        let streaming = response.has("stream")
+        let close_after = response.has("close")
+        let keep = !close_after
+        if keep {
+            headers["Connection"] = "keep-alive"
+        } else {
+            headers["Connection"] = "close"
+        }
+
+        var ok = true
+        if streaming {
+            let head = build_head(status, headers, true)
+            try {
+                tcp_write(conn, utf8_bytes(head + CRLF))
+            } catch err {
+                ok = false
+            }
+            if ok {
+                let write = fn (text) {
+                    tcp_write(conn, chunk_frame(text))
+                }
+                try {
+                    response["stream"](write)
+                    tcp_write(conn, utf8_bytes("0" + CRLF + CRLF))
+                } catch err {
+                    print("[http] stream failed: " + str(err))
+                    ok = false
+                }
+            }
+        } else {
+            var body = ""
+            if response.has("body") and response["body"] != null {
+                body = str(response["body"])
+            }
+            let bytes = utf8_bytes(body)
+            headers["Content-Length"] = str(len(bytes))
+            let head = build_head(status, headers, false)
+            var frame = utf8_bytes(head + CRLF)
+            for byte in bytes {
+                frame.push(byte)
+            }
+            try {
+                tcp_write(conn, frame)
+            } catch err {
+                ok = false
+            }
+        }
+
+        if !ok or !keep {
+            tcp_close(conn)
+            return
+        }
+        if parsed["headers"].has("connection") {
+            if parsed["headers"].get("connection").lower() == "close" {
+                tcp_close(conn)
+                return
+            }
+        }
+    }
+}
+
+// Start listening. Returns the server handle; `serve_forever` accepts on it.
+export fn http_listen(host, port) {
+    let listener = tcp_listen(host, port)
+    return { "listener": listener, "port": listener["port"], "host": listener["host"] }
+}
+
+export fn http_serve_forever(server, handler) {
+    while true {
+        var conn = null
+        try {
+            conn = tcp_accept(server["listener"], 30.0)
+        } catch err {
+            conn = null
+        }
+        if conn != null {
+            spawn(fn () {
+                try {
+                    serve_connection(conn, handler)
+                } catch err {
+                    print("[http] connection failed: " + str(err))
+                    try {
+                        tcp_close(conn)
+                    } catch inner {
+                        return null
+                    }
+                }
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+export fn http_json(status, value) {
+    return {
+        "status": status,
+        "headers": { "Content-Type": "application/json; charset=utf-8" },
+        "body": json_stringify(value)
+    }
+}
+
+export fn http_html(status, body) {
+    return {
+        "status": status,
+        "headers": {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store"
+        },
+        "body": body
+    }
+}
+
+export fn http_text(status, body) {
+    return {
+        "status": status,
+        "headers": { "Content-Type": "text/plain; charset=utf-8" },
+        "body": body
+    }
+}
+
+export fn http_redirect(location) {
+    return {
+        "status": 302,
+        "headers": { "Location": location, "Content-Type": "text/plain" },
+        "body": "redirecting"
+    }
+}
+
+export fn http_stream_response(status, headers, writer) {
+    return { "status": status, "headers": headers, "stream": writer }
+}

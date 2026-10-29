@@ -1,0 +1,96 @@
+// src/config.bun — one place for every knob.
+//
+// Order of precedence: environment, then bamboo.json, then the defaults.
+// The environment wins because a container sets it, and a file cannot
+// change a container.
+
+let DEFAULTS = {
+    "site_name": "Bamboo-api",
+    "site_url": "http://localhost:8787",
+    "port": 8787,
+    "host": "0.0.0.0",
+    "data_file": "data/bamboo.json",
+    "upstream_base_url": "https://api.apinex.bond/v1",
+    "upstream_api_key": "",
+    "upstream_timeout": 180,
+    "admin_email": "admin@localhost",
+    "admin_password": "bamboo-admin",
+    "default_rpm": 60,
+    "free_monthly_tokens": 100000,
+    "session_days": 7,
+    "contact_email": "support@localhost"
+}
+
+fn merge(base, extra) {
+    let out = {}
+    for key in base.keys() {
+        out[key] = base.get(key)
+    }
+    for key in extra.keys() {
+        out[key] = extra.get(key)
+    }
+    return out
+}
+
+fn read_file_config() {
+    if !file_exists("bamboo.json") {
+        return {}
+    }
+    try {
+        let parsed = json_parse(read_file("bamboo.json"))
+        if type_of(parsed) == "dict" {
+            return parsed
+        }
+        return {}
+    } catch err {
+        print("[config] bamboo.json is not readable: " + str(err))
+        return {}
+    }
+}
+
+fn env_str(name, fallback) {
+    return getenv_or(name, fallback)
+}
+
+fn env_int(name, fallback) {
+    let raw = getenv(name)
+    if raw == null {
+        return fallback
+    }
+    let text = str(raw).trim()
+    if text == "" {
+        return fallback
+    }
+    return int(text)
+}
+
+let FILE_CONFIG = read_file_config()
+let BASE = merge(DEFAULTS, FILE_CONFIG)
+
+export let CONFIG = {
+    "site_name": env_str("SITE_NAME", str(BASE["site_name"])),
+    "site_url": env_str("SITE_URL", str(BASE["site_url"])),
+    "port": env_int("PORT", int(BASE["port"])),
+    "host": env_str("HOST", str(BASE["host"])),
+    "data_file": env_str("DATA_FILE", str(BASE["data_file"])),
+    "upstream_base_url": env_str("UPSTREAM_BASE_URL", str(BASE["upstream_base_url"])),
+    "upstream_api_key": env_str("UPSTREAM_API_KEY", str(BASE["upstream_api_key"])),
+    "upstream_timeout": env_int("UPSTREAM_TIMEOUT", int(BASE["upstream_timeout"])),
+    "admin_email": env_str("ADMIN_EMAIL", str(BASE["admin_email"])),
+    "admin_password": env_str("ADMIN_PASSWORD", str(BASE["admin_password"])),
+    "default_rpm": env_int("DEFAULT_RPM", int(BASE["default_rpm"])),
+    "free_monthly_tokens": env_int("FREE_MONTHLY_TOKENS", int(BASE["free_monthly_tokens"])),
+    "session_days": env_int("SESSION_DAYS", int(BASE["session_days"])),
+    "contact_email": env_str("CONTACT_EMAIL", str(BASE["contact_email"]))
+}
+
+export fn config_get(key) {
+    if CONFIG.has(key) {
+        return CONFIG.get(key)
+    }
+    return null
+}
+
+export fn config_site_name() {
+    return CONFIG["site_name"]
+}

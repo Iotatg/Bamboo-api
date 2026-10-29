@@ -1,0 +1,216 @@
+// src/ui.bun — the console.
+//
+// One stylesheet, four pages. The look is a ledger: warm black paper, a
+// bamboo-green accent, hairlines instead of cards, and tabular numerals so
+// a column of money lines up.
+
+import { CONFIG } from "./config.bun"
+
+fn esc(text) {
+    var out = str(text)
+    out = out.replace("&", "&amp;")
+    out = out.replace("<", "&lt;")
+    out = out.replace(">", "&gt;")
+    out = out.replace("\"", "&quot;")
+    return out
+}
+
+export fn ui_styles() {
+    return read_file("assets/app.css")
+}
+
+fn font_links() {
+    return "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\"><link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin><link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap\">"
+}
+
+fn rail(active, admin) {
+    var dashboard_current = ""
+    var keys_current = ""
+    var docs_current = ""
+    var admin_current = ""
+    if active == "dashboard" {
+        dashboard_current = " aria-current=\"page\""
+    }
+    if active == "keys" {
+        keys_current = " aria-current=\"page\""
+    }
+    if active == "docs" {
+        docs_current = " aria-current=\"page\""
+    }
+    if active == "admin" {
+        admin_current = " aria-current=\"page\""
+    }
+    var admin_link = "<a href=\"/admin\"" + admin_current + ">Admin</a>"
+    if !admin {
+        admin_link = ""
+    }
+    return "<aside class=\"rail\">"
+        + "<div class=\"wordmark\"><span class=\"leaf\"></span>" + esc(CONFIG["site_name"]) + "</div>"
+        + "<nav aria-label=\"Console\">"
+        + "<a href=\"/dashboard\"" + dashboard_current + ">Overview</a>"
+        + "<a href=\"/dashboard#keys\"" + keys_current + ">API keys</a>"
+        + "<a href=\"/docs\"" + docs_current + ">Reference</a>"
+        + admin_link
+        + "</nav>"
+        + "<div class=\"culm\">"
+        + "<div class=\"node\"><span class=\"dot\"></span>upstream · apinex</div>"
+        + "<div class=\"node\"><span class=\"dot\"></span>v1 · chat, messages, responses</div>"
+        + "<div class=\"node\"><span class=\"dot warn\"></span>ledger · micro-dollars</div>"
+        + "</div>"
+        + "</aside>"
+}
+
+fn shell(title, active, body, admin, script) {
+    return chrome(title, active, body, admin, script, false)
+}
+
+fn chrome(title, active, body, admin, script, plain) {
+    var inner = "<div class=\"shell\">" + rail(active, admin) + "<main class=\"main\">" + body + "</main></div>"
+    if plain {
+        inner = body
+    }
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        + "<title>" + esc(title) + " · " + esc(CONFIG["site_name"]) + "</title>"
+        + font_links()
+        + "<link rel=\"stylesheet\" href=\"/assets/app.css\">"
+        + "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230b0d0a'/><path d='M8 3v10M5 6c0-2 1.3-3 3-3s3 1 3 3-1.3 3-3 3' stroke='%238fd694' stroke-width='1.4' fill='none'/></svg>\">"
+        + "</head><body>" + inner
+        + "<script>" + script + "</script></body></html>"
+}
+
+export fn ui_login_page(mode) {
+    var heading = "Sign in"
+    var switch_text = "New here? <a href=\"/register\">Create an account</a>"
+    if mode == "register" {
+        heading = "Create an account"
+        switch_text = "Already have one? <a href=\"/login\">Sign in</a>"
+    }
+    let body = "<div class=\"auth-wrap\"><div class=\"auth\">"
+        + "<div class=\"wordmark\" style=\"margin-bottom:26px\"><span class=\"leaf\"></span>" + esc(CONFIG["site_name"]) + " <em>gateway</em></div>"
+        + "<h1>" + esc(heading) + "</h1>"
+        + "<p class=\"sub\">One key for chat, messages, and responses. Metered per token, billed to the micro-dollar.</p>"
+        + "<form id=\"auth-form\">"
+        + "<div class=\"field\"><label for=\"name\">Name</label><input id=\"name\" name=\"name\" autocomplete=\"name\" required></div>"
+        + "<div class=\"field\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" autocomplete=\"email\" required></div>"
+        + "<div class=\"field\"><label for=\"password\">Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\" required minlength=\"8\"></div>"
+        + "<div id=\"auth-error\" class=\"notice bad\" hidden></div>"
+        + "<button type=\"submit\">" + esc(heading) + "</button>"
+        + "</form>"
+        + "<p class=\"switch\">" + switch_text + "</p>"
+        + "</div></div>"
+    let script = "const mode='" + mode + "';"
+        + "document.getElementById('auth-form').addEventListener('submit',async(e)=>{e.preventDefault();"
+        + "const box=document.getElementById('auth-error');box.hidden=true;"
+        + "const payload={email:email.value,password:password.value};"
+        + "if(mode==='register'){payload.name=name.value;}"
+        + "const res=await fetch('/api/auth/'+(mode==='register'?'register':'login'),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});"
+        + "const data=await res.json();"
+        + "if(!res.ok){box.textContent=data.error?.message||'Something went wrong.';box.hidden=false;return;}"
+        + "location.href='/dashboard';});"
+        + "const nameField=document.getElementById('name');"
+        + "if(mode!=='register'){nameField.parentElement.style.display='none';nameField.required=false;}"
+    return chrome(heading, "", body, false, script, true)
+}
+
+export fn ui_dashboard_page(user) {
+    let body = "<div class=\"page-head\"><div>"
+        + "<h1>Your <em>ledger</em></h1>"
+        + "<p class=\"sub\">Balance, keys, and the last fifty requests. Every number here is the number the gateway billed.</p>"
+        + "</div><div><button class=\"ghost\" id=\"signout\">Sign out</button></div></div>"
+        + "<div class=\"figures\">"
+        + "<div class=\"figure\"><div class=\"label\">Wallet</div><div class=\"value\" id=\"fig-balance\">—</div><div class=\"note\">USD, billed per token</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Free allowance</div><div class=\"value\" id=\"fig-free\">—</div><div class=\"note\">tokens left this month</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Rate limit</div><div class=\"value\" id=\"fig-rpm\">—</div><div class=\"note\">requests per minute</div></div>"
+        + "</div>"
+        + "<section class=\"section\" id=\"keys\"><div class=\"section-head\"><h2>API keys</h2><p>shown once, stored as a hash</p></div>"
+        + "<form class=\"inline\" id=\"key-form\" style=\"margin:18px 0 8px\"><div><label for=\"key-name\">Name</label><input id=\"key-name\" placeholder=\"production\" required></div>"
+        + "<button type=\"submit\">Create key</button></form>"
+        + "<div id=\"key-secret\"></div>"
+        + "<table><thead><tr><th>Name</th><th>Prefix</th><th class=\"num\">Spent</th><th>Last used</th><th></th></tr></thead><tbody id=\"keys-body\"></tbody></table>"
+        + "</section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Requests</h2><p>newest first</p></div>"
+        + "<table><thead><tr><th>When</th><th>Model</th><th>Endpoint</th><th class=\"num\">In</th><th class=\"num\">Out</th><th class=\"num\">Cost</th><th class=\"num\">ms</th></tr></thead><tbody id=\"usage-body\"></tbody></table>"
+        + "</section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>First call</h2><p>copy, paste, run</p></div>"
+        + "<pre id=\"snippet\">curl " + esc(CONFIG["site_url"]) + "/v1/chat/completions \\\n  -H \"Authorization: Bearer $BAMBOO_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'</pre>"
+        + "</section>"
+
+    let script = read_file("src/ui/dashboard.js")
+    return shell("Overview", "dashboard", body, false, script)
+}
+
+export fn ui_admin_page(admin) {
+    let body = "<div class=\"page-head\"><div>"
+        + "<h1>The <em>control plane</em></h1>"
+        + "<p class=\"sub\">Catalogue, pricing, accounts, and the upstream key. Everything the gateway charges is set here.</p>"
+        + "</div><div><button class=\"ghost\" id=\"signout\">Sign out</button></div></div>"
+        + "<div class=\"figures\">"
+        + "<div class=\"figure\"><div class=\"label\">Requests</div><div class=\"value\" id=\"fig-requests\">—</div><div class=\"note\">all time</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Billed</div><div class=\"value\" id=\"fig-revenue\">—</div><div class=\"note\">customer spend</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Accounts</div><div class=\"value\" id=\"fig-users\">—</div><div class=\"note\">registered</div></div>"
+        + "</div>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Catalogue</h2><p id=\"model-count\"></p></div>"
+        + "<div style=\"display:flex;gap:10px;margin:18px 0 6px\"><button id=\"import\">Import from APInex</button><button class=\"ghost\" id=\"add-model\">Add a model</button></div>"
+        + "<div id=\"admin-notice\"></div>"
+        + "<table class=\"catalogue\"><thead><tr><th>Model</th><th>Provider</th><th class=\"num\">In / 1M</th><th class=\"num\">Out / 1M</th><th>Status</th><th></th></tr></thead><tbody id=\"models-body\"></tbody></table>"
+        + "</section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Accounts</h2><p>credit a wallet in dollars</p></div>"
+        + "<table><thead><tr><th>Email</th><th>Status</th><th class=\"num\">Balance</th><th class=\"num\">Requests</th><th></th></tr></thead><tbody id=\"users-body\"></tbody></table>"
+        + "</section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Upstream</h2><p>the APInex key this gateway bills against</p></div>"
+        + "<form class=\"inline\" id=\"upstream-form\" style=\"margin:18px 0 8px\">"
+        + "<div style=\"flex:1\"><label for=\"upstream-key\">APInex key</label><input id=\"upstream-key\" placeholder=\"sk-apx-...\" style=\"width:100%\"></div>"
+        + "<button type=\"submit\">Save key</button></form>"
+        + "<p class=\"hint\" id=\"upstream-state\"></p>"
+        + "</section>"
+
+    let script = read_file("src/ui/admin.js")
+    return shell("Admin", "admin", body, true, script)
+}
+
+export fn ui_admin_login_page() {
+    let body = "<div class=\"auth-wrap\"><div class=\"auth\">"
+        + "<div class=\"wordmark\" style=\"margin-bottom:26px\"><span class=\"leaf\"></span>" + esc(CONFIG["site_name"]) + " <em>control plane</em></div>"
+        + "<h1>Admin</h1>"
+        + "<p class=\"sub\">Catalogue, pricing, and accounts.</p>"
+        + "<form id=\"admin-form\">"
+        + "<div class=\"field\"><label for=\"email\">Email</label><input id=\"email\" type=\"email\" autocomplete=\"username\" required></div>"
+        + "<div class=\"field\"><label for=\"password\">Password</label><input id=\"password\" type=\"password\" autocomplete=\"current-password\" required></div>"
+        + "<div id=\"auth-error\" class=\"notice bad\" hidden></div>"
+        + "<button type=\"submit\">Sign in</button>"
+        + "</form></div></div>"
+    let script = read_file("src/ui/admin-auth.js")
+    return chrome("Admin", "", body, false, script, true)
+}
+
+export fn ui_docs_page() {
+    let base = CONFIG["site_url"]
+    let body = "<div class=\"page-head\"><div>"
+        + "<h1>One key, three <em>protocols</em></h1>"
+        + "<p class=\"sub\">Point any OpenAI or Anthropic SDK at this base URL and send your Bamboo key. The gateway translates, forwards, meters, and bills.</p>"
+        + "</div></div>"
+        + "<div class=\"figures\">"
+        + "<div class=\"figure\"><div class=\"label\">Base URL</div><div class=\"value\" style=\"font-size:1rem;word-break:break-all\">" + esc(base) + "/v1</div><div class=\"note\">OpenAI-compatible</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Auth</div><div class=\"value\" style=\"font-size:1rem\">Bearer / x-api-key</div><div class=\"note\">bk_live_…</div></div>"
+        + "<div class=\"figure\"><div class=\"label\">Billing</div><div class=\"value\" style=\"font-size:1rem\">per token</div><div class=\"note\">input and output priced apart</div></div>"
+        + "</div>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Endpoints</h2><p>all under /v1</p></div>"
+        + "<table><thead><tr><th>Method</th><th>Path</th><th>What it does</th></tr></thead><tbody>"
+        + "<tr><td class=\"id\">GET</td><td class=\"id\">/models</td><td>the catalogue with live prices</td></tr>"
+        + "<tr><td class=\"id\">POST</td><td class=\"id\">/chat/completions</td><td>OpenAI chat, streaming and tools</td></tr>"
+        + "<tr><td class=\"id\">POST</td><td class=\"id\">/messages</td><td>Anthropic messages, streaming and tools</td></tr>"
+        + "<tr><td class=\"id\">POST</td><td class=\"id\">/responses</td><td>OpenAI responses, streaming</td></tr>"
+        + "<tr><td class=\"id\">GET</td><td class=\"id\">/balance</td><td>wallet, free allowance, key limits</td></tr>"
+        + "<tr><td class=\"id\">GET</td><td class=\"id\">/usage</td><td>the last fifty requests</td></tr>"
+        + "<tr><td class=\"id\">GET</td><td class=\"id\">/rpm</td><td>the rate limit on this account</td></tr>"
+        + "</tbody></table></section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Chat</h2><p>streaming is a flag, not a different call</p></div>"
+        + "<pre>curl " + esc(base) + "/v1/chat/completions \\\n  -H \"Authorization: Bearer $BAMBOO_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"model\": \"gpt/4o-mini\",\n    \"stream\": true,\n    \"messages\": [{\"role\": \"user\", \"content\": \"explain a ledger in one line\"}]\n  }'</pre></section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Messages</h2><p>the Anthropic shape, unchanged</p></div>"
+        + "<pre>curl " + esc(base) + "/v1/messages \\\n  -H \"x-api-key: $BAMBOO_KEY\" \\\n  -H \"anthropic-version: 2023-06-01\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"model\": \"claude/sonnet-5\",\n    \"max_tokens\": 512,\n    \"messages\": [{\"role\": \"user\", \"content\": \"hello\"}]\n  }'</pre></section>"
+        + "<section class=\"section\"><div class=\"section-head\"><h2>Errors</h2><p>the shape every SDK already parses</p></div>"
+        + "<pre>{\n  \"error\": {\n    \"message\": \"This request cannot be paid for...\",\n    \"type\": \"insufficient_quota\",\n    \"param\": null,\n    \"code\": \"insufficient_balance\"\n  }\n}</pre>"
+        + "<p class=\"hint\">401 unknown key · 402 no balance · 403 revoked key or suspended account · 404 unknown model · 429 over the per-minute limit · 502 upstream unreachable.</p></section>"
+    return shell("Reference", "docs", body, false, "")
+}

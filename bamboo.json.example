@@ -1,0 +1,16 @@
+{
+  "site_name": "Bamboo-api",
+  "site_url": "http://localhost:8787",
+  "port": 8787,
+  "host": "0.0.0.0",
+  "data_file": "data/bamboo.json",
+  "upstream_base_url": "https://api.apinex.bond/v1",
+  "upstream_api_key": "",
+  "upstream_timeout": 180,
+  "admin_email": "admin@localhost",
+  "admin_password": "change-this-password",
+  "default_rpm": 60,
+  "free_monthly_tokens": 100000,
+  "session_days": 7,
+  "contact_email": "support@example.com"
+}

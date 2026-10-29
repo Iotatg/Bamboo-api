@@ -1,0 +1,641 @@
+// src/console.bun — the pages and the JSON behind them.
+//
+// The console is server-rendered HTML with a small script per page; the
+// data it shows comes from the /api routes below, which are the same
+// numbers the gateway bills against.
+
+import { http_reason, http_listen, http_serve_forever, http_json, http_html, http_text, http_redirect, http_stream_response } from "./http.bun"
+import { store_data, store_save, store_mutate, store_all, store_find, store_where, store_by_id, store_insert, store_remove, store_setting, store_set_setting, store_trim_usage } from "./store.bun"
+import { auth_api_key, auth_authenticate, auth_cookies, auth_create_session, auth_destroy_session, auth_session_user, auth_session_admin, auth_register, auth_login, auth_login_admin, auth_USER_COOKIE, auth_ADMIN_COOKIE } from "./auth.bun"
+import { crypto_hex_of, crypto_random_hex, crypto_uuid, crypto_new_api_key, crypto_hash_key, crypto_key_prefix, crypto_hash_password, crypto_verify_password, crypto_hex_to_bytes, crypto_same_secret, crypto_token } from "./crypto.bun"
+import { billing_price_from_dollars, billing_dollars_from_price, billing_charge, billing_reserve, billing_format_usd, billing_format_price, billing_format_tokens } from "./billing.bun"
+import { limit_consume, limit_headers, limit_client_address } from "./limit.bun"
+import { upstream_split_url, upstream_url_for, upstream_post_json, upstream_get_json, upstream_open_stream, upstream_pump, upstream_post_stream } from "./upstream.bun"
+import { ui_styles, ui_login_page, ui_dashboard_page, ui_admin_page, ui_admin_login_page, ui_docs_page } from "./ui.bun"
+import { router_create, router_add, router_get, router_post, router_patch, router_delete_route, router_match } from "./router.bun"
+import { CONFIG } from "./config.bun"
+
+// The upstream key can come from the environment or from the admin console;
+// the console wins once someone saves one there.
+fn upstream_key() {
+    let stored = store_setting("upstream_key", "")
+    if stored != null and str(stored) != "" {
+        return str(stored)
+    }
+    return CONFIG["upstream_api_key"]
+}
+
+fn crypto_secret() {
+    return crypto_new_api_key()
+}
+
+fn hash_of(secret) {
+    return crypto_hash_key(secret)
+}
+
+fn error_json(status, message) {
+    return http_json(status, { "error": { "message": message, "type": "console_error" } })
+}
+
+fn read_body(req) {
+    if req["body"] == null or req["body"] == "" {
+        return {}
+    }
+    try {
+        let value = json_parse(req["body"])
+        if type_of(value) == "dict" {
+            return value
+        }
+        return {}
+    } catch err {
+        return {}
+    }
+}
+
+fn session_cookie(name, session_id) {
+    let seconds = CONFIG["session_days"] * 86400
+    return name + "=" + session_id + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + str(seconds)
+}
+
+fn with_cookie(response, cookie) {
+    response["headers"]["Set-Cookie"] = cookie
+    return response
+}
+
+fn provider_of(model_id) {
+    let mark = model_id.index_of("/")
+    var raw = "other"
+    if mark > 0 {
+        raw = model_id.slice(0, mark).lower()
+    }
+    if raw == "gpt" or raw == "openai" {
+        return "GPT"
+    }
+    if raw == "claude" or raw == "anthropic" {
+        return "Claude"
+    }
+    if raw == "gemini" or raw == "google" {
+        return "Gemini"
+    }
+    if raw == "free" {
+        return "Free"
+    }
+    if raw == "kimi" or raw == "moonshot" {
+        return "Kimi"
+    }
+    if raw == "deepseek" {
+        return "DeepSeek"
+    }
+    if raw == "glm" or raw == "zhipu" {
+        return "GLM"
+    }
+    if raw == "grok" or raw == "xai" {
+        return "Grok"
+    }
+    if raw == "tencent" {
+        return "Tencent"
+    }
+    return raw
+}
+
+fn price_from_model(entry) {
+    // Two shapes arrive: a `pricing` object in dollars per token, or flat
+    // per-million fields. Both become micro-dollars per million tokens.
+    if entry.has("input_dollars_per_million") {
+        return billing_price_from_dollars(entry["input_dollars_per_million"])
+    }
+    if entry.has("pricing") and type_of(entry["pricing"]) == "dict" {
+        let pricing = entry["pricing"]
+        if pricing.has("prompt") {
+            let per_token = float(pricing["prompt"])
+            return int(per_token * 1000000 * 1000000 + 0.5)
+        }
+        if pricing.has("input_per_million") {
+            return billing_price_from_dollars(pricing["input_per_million"])
+        }
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+fn page_root(req) {
+    if auth_session_user(req) != null {
+        return http_redirect("/dashboard")
+    }
+    return http_redirect("/login")
+}
+
+fn page_login(req) {
+    return http_html(200, ui_login_page("login"))
+}
+
+fn page_register(req) {
+    return http_html(200, ui_login_page("register"))
+}
+
+fn page_dashboard(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return http_redirect("/login")
+    }
+    return http_html(200, ui_dashboard_page(user))
+}
+
+fn page_admin(req) {
+    let admin = auth_session_admin(req)
+    if admin == null {
+        return http_html(200, ui_admin_login_page())
+    }
+    return http_html(200, ui_admin_page(admin))
+}
+
+fn page_docs(req) {
+    return http_html(200, ui_docs_page())
+}
+
+fn page_css(req) {
+    return {
+        "status": 200,
+        "headers": { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=300" },
+        "body": ui_styles()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Customer API
+// ---------------------------------------------------------------------------
+
+fn api_register(req) {
+    let body = read_body(req)
+    var name = "there"
+    if body.has("name") {
+        name = str(body["name"])
+    }
+    let result = auth_register(name, str(body["email"]), str(body["password"]))
+    if !result["ok"] {
+        return error_json(400, result["message"])
+    }
+    let session = auth_create_session(result["user"]["id"], "user")
+    return with_cookie(http_json(201, { "ok": true }), session_cookie(auth_USER_COOKIE, session["id"]))
+}
+
+fn api_login(req) {
+    let body = read_body(req)
+    let result = auth_login(str(body["email"]), str(body["password"]))
+    if !result["ok"] {
+        return error_json(401, result["message"])
+    }
+    let session = auth_create_session(result["user"]["id"], "user")
+    return with_cookie(http_json(200, { "ok": true }), session_cookie(auth_USER_COOKIE, session["id"]))
+}
+
+fn api_logout(req) {
+    let jar = auth_cookies(req)
+    auth_destroy_session(jar.get(auth_USER_COOKIE))
+    return with_cookie(http_json(200, { "ok": true }), auth_USER_COOKIE + "=; Path=/; Max-Age=0; HttpOnly")
+}
+
+fn api_me(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return error_json(401, "Sign in first.")
+    }
+    var rpm = user["rpm_limit"]
+    if rpm <= 0 {
+        rpm = CONFIG["default_rpm"]
+    }
+    return http_json(200, {
+        "id": user["id"],
+        "name": user["name"],
+        "email": user["email"],
+        "balance_display": billing_format_usd(user["balance_micros"]),
+        "free_tokens": user["free_tokens"],
+        "rpm_limit": rpm
+    })
+}
+
+fn api_usage(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return error_json(401, "Sign in first.")
+    }
+    let rows = store_where("usage", fn (item) {
+        return item["user_id"] == user["id"]
+    })
+    let data = []
+    var index = len(rows) - 1
+    var count = 0
+    while index >= 0 and count < 50 {
+        let row = rows[index]
+        data.push({
+            "model": row["model"],
+            "endpoint": row["endpoint"],
+            "input_tokens": row["input_tokens"],
+            "output_tokens": row["output_tokens"],
+            "cost_micros": row["cost_micros"],
+            "latency_ms": row["latency_ms"],
+            "status": row["status"],
+            "created_at": int(row["created_at"])
+        })
+        index = index - 1
+        count = count + 1
+    }
+    return http_json(200, { "data": data })
+}
+
+fn api_keys_list(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return error_json(401, "Sign in first.")
+    }
+    let data = []
+    for key in store_where("keys", fn (item) {
+        return item["user_id"] == user["id"]
+    }) {
+        var last_used = null
+        if key["last_used_at"] != null {
+            last_used = int(key["last_used_at"])
+        }
+        data.push({
+            "id": key["id"],
+            "name": key["name"],
+            "prefix": key["prefix"],
+            "status": key["status"],
+            "spent": billing_dollars_from_price(key["spent_micros"]),
+            "last_used_at": last_used
+        })
+    }
+    return http_json(200, { "data": data })
+}
+
+fn api_keys_create(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return error_json(401, "Sign in first.")
+    }
+    let window = limit_consume("keycreate:" + user["id"], 10, 3600)
+    if !window["ok"] {
+        return error_json(429, "Ten keys per hour. Try again in " + str(window["retry_after"]) + "s.")
+    }
+    let body = read_body(req)
+    var name = "default"
+    if body.has("name") and str(body["name"]).trim() != "" {
+        name = str(body["name"]).trim()
+    }
+    let secret = crypto_secret()
+    let key = {
+        "id": "key_" + str(int(now() * 1000)),
+        "user_id": user["id"],
+        "name": name,
+        "prefix": secret.slice(0, 16) + "...",
+        "hash": hash_of(secret),
+        "spend_limit_micros": 0,
+        "spent_micros": 0,
+        "status": "active",
+        "created_at": now(),
+        "last_used_at": null
+    }
+    store_insert("keys", key)
+    return http_json(201, { "id": key["id"], "name": name, "secret": secret })
+}
+
+fn api_keys_delete(req) {
+    let user = auth_session_user(req)
+    if user == null {
+        return error_json(401, "Sign in first.")
+    }
+    let key = store_by_id("keys", req["params"]["id"])
+    if key == null or key["user_id"] != user["id"] {
+        return error_json(404, "No such key.")
+    }
+    store_mutate(fn (doc) {
+        key["status"] = "revoked"
+        return null
+    })
+    return http_json(200, { "ok": true })
+}
+
+// ---------------------------------------------------------------------------
+// Admin API
+// ---------------------------------------------------------------------------
+
+fn api_admin_login(req) {
+    let body = read_body(req)
+    let window = limit_consume("adminlogin:" + limit_client_address(req), 8, 300)
+    if !window["ok"] {
+        return error_json(429, "Too many attempts. Wait a minute.")
+    }
+    let result = auth_login_admin(str(body["email"]), str(body["password"]))
+    if !result["ok"] {
+        return error_json(401, result["message"])
+    }
+    let session = auth_create_session(result["admin"]["id"], "admin")
+    return with_cookie(http_json(200, { "ok": true }), session_cookie(auth_ADMIN_COOKIE, session["id"]))
+}
+
+fn api_admin_logout(req) {
+    let jar = auth_cookies(req)
+    auth_destroy_session(jar.get(auth_ADMIN_COOKIE))
+    return with_cookie(http_json(200, { "ok": true }), auth_ADMIN_COOKIE + "=; Path=/; Max-Age=0; HttpOnly")
+}
+
+fn admin_only(req) {
+    let admin = auth_session_admin(req)
+    if admin == null {
+        return null
+    }
+    return admin
+}
+
+fn api_admin_overview(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let usage = store_all("usage")
+    var revenue = 0
+    for row in usage {
+        revenue = revenue + row["cost_micros"]
+    }
+    let models = store_where("models", fn (item) {
+        return item["status"] == "active"
+    })
+    let key = upstream_key()
+    return http_json(200, {
+        "requests": len(usage),
+        "revenue_display": billing_format_usd(revenue),
+        "users": len(store_all("users")),
+        "models": len(models),
+        "upstream_configured": key != "",
+        "upstream_base": CONFIG["upstream_base_url"]
+    })
+}
+
+fn api_admin_models(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let data = []
+    for model in store_all("models") {
+        data.push({
+            "id": model["id"],
+            "name": model["name"],
+            "provider": model["provider"],
+            "status": model["status"],
+            "context_window": model["context_window"],
+            "input_dollars": billing_dollars_from_price(model["input_price_micros"]),
+            "output_dollars": billing_dollars_from_price(model["output_price_micros"])
+        })
+    }
+    return http_json(200, { "data": data })
+}
+
+fn api_admin_model_patch(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let model = store_by_id("models", req["params"]["id"])
+    if model == null {
+        return error_json(404, "No such model.")
+    }
+    let body = read_body(req)
+    store_mutate(fn (doc) {
+        if body.has("in") {
+            model["input_price_micros"] = billing_price_from_dollars(body["in"])
+        }
+        if body.has("out") {
+            model["output_price_micros"] = billing_price_from_dollars(body["out"])
+        }
+        if body.has("status") {
+            model["status"] = str(body["status"])
+        }
+        return null
+    })
+    return http_json(200, { "ok": true })
+}
+
+fn api_admin_model_create(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let body = read_body(req)
+    if !body.has("id") {
+        return error_json(400, "A model needs an id.")
+    }
+    let model_id = str(body["id"])
+    let existing = store_by_id("models", model_id)
+    if existing != null {
+        return error_json(409, "That model already exists.")
+    }
+    var name = model_id
+    if body.has("name") {
+        name = str(body["name"])
+    }
+    var upstream_id = model_id
+    if body.has("upstream_id") {
+        upstream_id = str(body["upstream_id"])
+    }
+    let model = {
+        "id": model_id,
+        "provider": provider_of(model_id),
+        "name": name,
+        "upstream_id": upstream_id,
+        "context_window": 0,
+        "input_price_micros": 0,
+        "output_price_micros": 0,
+        "status": "active",
+        "created_at": now()
+    }
+    store_insert("models", model)
+    return http_json(201, { "ok": true })
+}
+
+fn api_admin_import(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    if upstream_key() == "" {
+        return error_json(400, "Save an APInex key first.")
+    }
+    let result = upstream_get_json("/models", null)
+    if !result["ok"] {
+        return error_json(502, "The upstream could not be reached.")
+    }
+    if result["status"] < 200 or result["status"] >= 300 {
+        return error_json(result["status"], "APInex refused the catalogue request: " + str(result["body"]))
+    }
+    var payload = {}
+    try {
+        payload = json_parse(result["body"])
+    } catch err {
+        return error_json(502, "The catalogue was not JSON.")
+    }
+    var entries = []
+    if payload.has("data") {
+        entries = payload["data"]
+    }
+    var imported = 0
+    var updated = 0
+    store_mutate(fn (doc) {
+        for entry in entries {
+            if type_of(entry) != "dict" or !entry.has("id") {
+                continue
+            }
+            let model_id = str(entry["id"])
+            let price_in = price_from_model(entry)
+            var price_out = price_in
+            if entry.has("output_dollars_per_million") {
+                price_out = billing_price_from_dollars(entry["output_dollars_per_million"])
+            }
+            if entry.has("pricing") and type_of(entry["pricing"]) == "dict" and entry["pricing"].has("completion") {
+                price_out = int(float(entry["pricing"]["completion"]) * 1000000 * 1000000 + 0.5)
+            }
+            var context = 0
+            if entry.has("context_window") {
+                context = int(entry["context_window"])
+            }
+            if entry.has("context_length") {
+                context = int(entry["context_length"])
+            }
+            var existing = null
+            for model in doc["models"] {
+                if model["id"] == model_id {
+                    existing = model
+                }
+            }
+            if existing == null {
+                doc["models"].push({
+                    "id": model_id,
+                    "provider": provider_of(model_id),
+                    "name": model_id,
+                    "upstream_id": model_id,
+                    "context_window": context,
+                    "input_price_micros": price_in,
+                    "output_price_micros": price_out,
+                    "status": "active",
+                    "created_at": now()
+                })
+                imported = imported + 1
+            } else {
+                existing["context_window"] = context
+                if existing["input_price_micros"] == 0 {
+                    existing["input_price_micros"] = price_in
+                }
+                if existing["output_price_micros"] == 0 {
+                    existing["output_price_micros"] = price_out
+                }
+                updated = updated + 1
+            }
+        }
+        return null
+    })
+    return http_json(200, { "ok": true, "imported": imported, "updated": updated })
+}
+
+fn api_admin_users(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let data = []
+    for user in store_all("users") {
+        var requests = 0
+        for row in store_all("usage") {
+            if row["user_id"] == user["id"] {
+                requests = requests + 1
+            }
+        }
+        data.push({
+            "id": user["id"],
+            "email": user["email"],
+            "status": user["status"],
+            "balance_display": billing_format_usd(user["balance_micros"]),
+            "requests": requests
+        })
+    }
+    return http_json(200, { "data": data })
+}
+
+fn api_admin_credit(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let user = store_by_id("users", req["params"]["id"])
+    if user == null {
+        return error_json(404, "No such account.")
+    }
+    let body = read_body(req)
+    var dollars = 10.0
+    if body.has("dollars") {
+        dollars = float(body["dollars"])
+    }
+    if dollars <= 0 {
+        return error_json(400, "Credit a positive amount.")
+    }
+    let amount = billing_price_from_dollars(dollars)
+    store_mutate(fn (doc) {
+        user["balance_micros"] = user["balance_micros"] + amount
+        doc["ledger"].push({
+            "id": "led_" + str(int(now() * 1000)),
+            "user_id": user["id"],
+            "type": "credit",
+            "amount_micros": amount,
+            "note": "Admin credit",
+            "created_at": now()
+        })
+        return null
+    })
+    return http_json(200, { "ok": true, "balance_display": billing_format_usd(user["balance_micros"]) })
+}
+
+fn api_admin_upstream(req) {
+    if admin_only(req) == null {
+        return error_json(401, "Admin session required.")
+    }
+    let body = read_body(req)
+    var key = ""
+    if body.has("key") {
+        key = str(body["key"]).trim()
+    }
+    if key == "" {
+        return error_json(400, "Paste an APInex key.")
+    }
+    store_set_setting("upstream_key", key)
+    return http_json(200, { "ok": true })
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+export fn console_register(router) {
+    router_get(router, "/", page_root)
+    router_get(router, "/login", page_login)
+    router_get(router, "/register", page_register)
+    router_get(router, "/dashboard", page_dashboard)
+    router_get(router, "/admin", page_admin)
+    router_get(router, "/docs", page_docs)
+    router_get(router, "/assets/app.css", page_css)
+
+    router_post(router, "/api/auth/register", api_register)
+    router_post(router, "/api/auth/login", api_login)
+    router_post(router, "/api/auth/logout", api_logout)
+    router_get(router, "/api/me", api_me)
+    router_get(router, "/api/usage", api_usage)
+    router_get(router, "/api/keys", api_keys_list)
+    router_post(router, "/api/keys", api_keys_create)
+    router_delete_route(router, "/api/keys/:id", api_keys_delete)
+
+    router_post(router, "/api/admin/login", api_admin_login)
+    router_post(router, "/api/admin/logout", api_admin_logout)
+    router_get(router, "/api/admin/overview", api_admin_overview)
+    router_get(router, "/api/admin/models", api_admin_models)
+    router_post(router, "/api/admin/models", api_admin_model_create)
+    router_post(router, "/api/admin/models/import", api_admin_import)
+    router_patch(router, "/api/admin/models/:id", api_admin_model_patch)
+    router_get(router, "/api/admin/users", api_admin_users)
+    router_post(router, "/api/admin/users/:id/credit", api_admin_credit)
+    router_post(router, "/api/admin/upstream", api_admin_upstream)
+    return null
+}

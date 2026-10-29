@@ -1,0 +1,27 @@
+// src/seed.bun — the one row a fresh install needs: an admin.
+//
+// Models are not seeded. A catalogue of invented prices would be a lie;
+// the admin imports the real one from APInex in one click.
+
+import { store_data, store_save, store_mutate, store_all, store_find, store_where, store_by_id, store_insert, store_remove, store_setting, store_set_setting, store_trim_usage } from "./store.bun"
+import { crypto_hex_of, crypto_random_hex, crypto_uuid, crypto_new_api_key, crypto_hash_key, crypto_key_prefix, crypto_hash_password, crypto_verify_password, crypto_hex_to_bytes, crypto_same_secret, crypto_token } from "./crypto.bun"
+import { CONFIG } from "./config.bun"
+
+export fn seed_ensure() {
+    let existing = store_all("admins")
+    if len(existing) > 0 {
+        return null
+    }
+    let admin = {
+        "id": "adm_" + crypto_random_hex(8),
+        "email": str(CONFIG["admin_email"]).lower(),
+        "password": crypto_hash_password(str(CONFIG["admin_password"])),
+        "created_at": now()
+    }
+    store_insert("admins", admin)
+    print("[seed] admin created: " + admin["email"])
+    if CONFIG["admin_password"] == "bamboo-admin" {
+        print("[seed] the default password is in use — set ADMIN_PASSWORD before exposing this server")
+    }
+    return null
+}

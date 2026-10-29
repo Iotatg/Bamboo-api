@@ -1,0 +1,100 @@
+// src/router.bun — method + path to a handler.
+//
+// A pattern is made of literal segments and two kinds of variable:
+//   :name   one segment, captured into params
+//   *name   the rest of the path, captured into params
+//
+// The first pattern that matches wins, so register the specific routes
+// before the catch-all ones.
+
+export fn router_create() {
+    return { "routes": [] }
+}
+
+export fn router_add(router, method, pattern, handler) {
+    var segments = pattern.split("/")
+    if len(segments) > 1 and segments[len(segments) - 1] == "" {
+        segments = segments.slice(0, len(segments) - 1)
+    }
+    router["routes"].push({
+        "method": method.upper(),
+        "pattern": pattern,
+        "segments": segments,
+        "handler": handler
+    })
+    return null
+}
+
+export fn router_get(router, pattern, handler) {
+    return router_add(router, "GET", pattern, handler)
+}
+
+export fn router_post(router, pattern, handler) {
+    return router_add(router, "POST", pattern, handler)
+}
+
+export fn router_patch(router, pattern, handler) {
+    return router_add(router, "PATCH", pattern, handler)
+}
+
+export fn router_delete_route(router, pattern, handler) {
+    return router_add(router, "DELETE", pattern, handler)
+}
+
+fn match_segments(segments, path_segments) {
+    let params = {}
+    var i = 0
+    while i < len(segments) {
+        let segment = segments[i]
+        if segment.starts_with("*") {
+            let name = segment.slice(1, len(segment))
+            var rest = ""
+            var j = i
+            while j < len(path_segments) {
+                if j > i {
+                    rest = rest + "/"
+                }
+                rest = rest + path_segments[j]
+                j = j + 1
+            }
+            params[name] = rest
+            return params
+        }
+        if i >= len(path_segments) {
+            return null
+        }
+        if segment.starts_with(":") {
+            params[segment.slice(1, len(segment))] = path_segments[i]
+        } else if segment != path_segments[i] {
+            return null
+        }
+        i = i + 1
+    }
+    if len(path_segments) != len(segments) {
+        return null
+    }
+    return params
+}
+
+export fn router_match(router, method, path) {
+    let upper = method.upper()
+    var path_segments = path.split("/")
+    if len(path_segments) > 1 and path_segments[len(path_segments) - 1] == "" {
+        path_segments = path_segments.slice(0, len(path_segments) - 1)
+    }
+    var allowed = []
+    for route in router["routes"] {
+        let params = match_segments(route["segments"], path_segments)
+        if params == null {
+            continue
+        }
+        if route["method"] == upper {
+            return { "handler": route["handler"], "params": params }
+        }
+        allowed.push(route["method"])
+    }
+    if len(allowed) > 0 {
+        return { "method_not_allowed": true, "allowed": allowed }
+    }
+    return null
+}

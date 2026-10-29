@@ -1,0 +1,89 @@
+// src/limit.bun — fixed-window rate limits, per key and per address.
+//
+// The counter lives in memory: a gateway restart forgives a minute of
+// overuse, which is the right trade for a limit that exists to protect the
+// upstream, not to bill anyone.
+
+let BUCKETS = {}
+var LAST_SWEEP = 0.0
+
+export fn limit_consume(key, limit, window_seconds) {
+    let now_seconds = now()
+    if now_seconds - LAST_SWEEP > 60.0 {
+        LAST_SWEEP = now_seconds
+        sweep(now_seconds)
+    }
+    if !BUCKETS.has(key) {
+        BUCKETS[key] = { "count": 0, "reset": now_seconds + window_seconds }
+    }
+    let bucket = BUCKETS[key]
+    if bucket["reset"] <= now_seconds {
+        bucket["count"] = 0
+        bucket["reset"] = now_seconds + window_seconds
+    }
+    if bucket["count"] >= limit {
+        var wait = bucket["reset"] - now_seconds
+        if wait < 1.0 {
+            wait = 1.0
+        }
+        return {
+            "ok": false,
+            "limit": limit,
+            "remaining": 0,
+            "retry_after": int(wait + 0.999),
+            "reset": bucket["reset"]
+        }
+    }
+    bucket["count"] = bucket["count"] + 1
+    return {
+        "ok": true,
+        "limit": limit,
+        "remaining": limit - bucket["count"],
+        "retry_after": 0,
+        "reset": bucket["reset"]
+    }
+}
+
+fn sweep(now_seconds) {
+    let stale = []
+    for key in BUCKETS.keys() {
+        if BUCKETS[key]["reset"] <= now_seconds {
+            stale.push(key)
+        }
+    }
+    for key in stale {
+        BUCKETS.remove(key)
+    }
+    return null
+}
+
+export fn limit_headers(result) {
+    let out = {
+        "X-RateLimit-Limit": str(result["limit"]),
+        "X-RateLimit-Remaining": str(result["remaining"]),
+        "X-RateLimit-Reset": str(int(result["reset"]))
+    }
+    if result["ok"] == false {
+        out["Retry-After"] = str(result["retry_after"])
+    }
+    return out
+}
+
+export fn limit_client_address(req) {
+    if req["headers"].has("x-forwarded-for") {
+        let forwarded = req["headers"].get("x-forwarded-for")
+        let first = forwarded.split(",")[0].trim()
+        if first != "" {
+            return first
+        }
+    }
+    if req["peer"] != null {
+        let peer = str(req["peer"])
+        let mark = peer.index_of(":")
+        if mark > 0 {
+            return peer.slice(0, mark)
+        }
+        return peer
+    }
+    return "unknown"
+}

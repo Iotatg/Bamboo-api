@@ -1,0 +1,119 @@
+// src/billing.bun — money, in micro-dollars.
+//
+// One unit is one millionth of a dollar, so a wallet balance is an integer
+// and a charge never loses a fraction. A model price is quoted in dollars
+// per million tokens, which is the same number as micro-dollars per token;
+// the arithmetic below is therefore one multiplication and one ceiling.
+
+let MICROS_PER_USD = 1000000
+let TOKENS_PER_MILLION = 1000000
+
+// A price stored as micro-dollars per million tokens.
+export fn billing_price_from_dollars(dollars) {
+    if dollars == null {
+        return 0
+    }
+    let value = float(dollars)
+    if value <= 0 {
+        return 0
+    }
+    return int(value * MICROS_PER_USD + 0.5)
+}
+
+export fn billing_dollars_from_price(price_micros) {
+    return float(price_micros) / float(MICROS_PER_USD)
+}
+
+// The charge for a request, rounded up to the next micro-dollar.
+export fn billing_charge(input_tokens, output_tokens, input_price, output_price) {
+    var total = 0
+    if input_tokens > 0 and input_price > 0 {
+        total = total + (input_tokens * input_price + TOKENS_PER_MILLION - 1) / TOKENS_PER_MILLION
+    }
+    if output_tokens > 0 and output_price > 0 {
+        total = total + (output_tokens * output_price + TOKENS_PER_MILLION - 1) / TOKENS_PER_MILLION
+    }
+    if total < 0 {
+        return 0
+    }
+    return total
+}
+
+// What a request could cost at most, used to reserve before it runs.
+export fn billing_reserve(input_tokens, max_output_tokens, input_price, output_price) {
+    return billing_charge(input_tokens, max_output_tokens, input_price, output_price)
+}
+
+export fn billing_format_usd(micros) {
+    if micros == 0 {
+        return "$0.00"
+    }
+    var negative = false
+    var value = micros
+    if value < 0 {
+        negative = true
+        value = 0 - value
+    }
+    let whole = value / MICROS_PER_USD
+    let rest = value % MICROS_PER_USD
+    var fraction = str(rest)
+    while len(fraction) < 6 {
+        fraction = "0" + fraction
+    }
+    var text = ""
+    if rest % 10000 == 0 {
+        text = "$" + group(whole) + "." + fraction.slice(0, 2)
+    } else {
+        text = "$" + group(whole) + "." + fraction
+        while text.ends_with("0") and !text.ends_with(".00") and len(text.split(".")[1]) > 2 {
+            text = text.slice(0, len(text) - 1)
+        }
+    }
+    if negative {
+        text = "-" + text
+    }
+    return text
+}
+
+// A price per million tokens, as the console shows it.
+export fn billing_format_price(price_micros) {
+    if price_micros == 0 {
+        return "free"
+    }
+    let dollars = price_micros / MICROS_PER_USD
+    let cents = price_micros % MICROS_PER_USD
+    var fraction = str(cents)
+    while len(fraction) < 6 {
+        fraction = "0" + fraction
+    }
+    return "$" + str(dollars) + "." + fraction.slice(0, 2)
+}
+
+export fn billing_format_tokens(count) {
+    if count >= 1000000000 {
+        return str(count / 1000000000) + "B"
+    }
+    if count >= 1000000 {
+        return str(count / 1000000) + "M"
+    }
+    if count >= 1000 {
+        return str(count / 1000) + "K"
+    }
+    return str(count)
+}
+
+fn group(number) {
+    let text = str(number)
+    var out = ""
+    var count = 0
+    var i = len(text) - 1
+    while i >= 0 {
+        out = text.slice(i, i + 1) + out
+        count = count + 1
+        if count % 3 == 0 and i > 0 {
+            out = "," + out
+        }
+        i = i - 1
+    }
+    return out
+}

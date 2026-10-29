@@ -1,0 +1,91 @@
+// src/crypto.bun — keys, hashes, and the bytes-to-text edges the language
+// leaves to the program.
+
+let HEX = "0123456789abcdef"
+
+export fn crypto_hex_of(data) {
+    var out = ""
+    for byte in data {
+        out = out + HEX[byte / 16] + HEX[byte % 16]
+    }
+    return out
+}
+
+export fn crypto_random_hex(bytes) {
+    return crypto_hex_of(random_bytes(bytes))
+}
+
+export fn crypto_uuid() {
+    let raw = crypto_random_hex(16)
+    return raw.slice(0, 8) + "-" + raw.slice(8, 12) + "-" + raw.slice(12, 16) + "-" + raw.slice(16, 20) + "-" + raw.slice(20, 32)
+}
+
+// A customer key looks like bk_live_<40 hex>. The prefix is what the console
+// shows; only the hash is stored.
+export fn crypto_new_api_key() {
+    return "bk_live_" + crypto_random_hex(20)
+}
+
+export fn crypto_hash_key(secret) {
+    return crypto_hex_of(sha256(secret))
+}
+
+export fn crypto_key_prefix(secret) {
+    if len(secret) <= 16 {
+        return secret
+    }
+    return secret.slice(0, 16) + "..."
+}
+
+// PBKDF2-SHA512 with a per-password salt. The stored form is salt:hash.
+export fn crypto_hash_password(password) {
+    let salt = random_bytes(16)
+    let derived = pbkdf2_sha512(utf8_bytes(password), salt, 120000, 32)
+    return crypto_hex_of(salt) + ":" + crypto_hex_of(derived)
+}
+
+export fn crypto_verify_password(password, stored) {
+    let parts = stored.split(":")
+    if len(parts) != 2 {
+        return false
+    }
+    let salt = crypto_hex_to_bytes(parts[0])
+    let expected = parts[1]
+    let derived = pbkdf2_sha512(utf8_bytes(password), salt, 120000, 32)
+    return crypto_hex_of(derived) == expected
+}
+
+export fn crypto_hex_to_bytes(text) {
+    let out = []
+    var i = 0
+    while i + 1 < len(text) {
+        let high = HEX.index_of(text.slice(i, i + 1))
+        let low = HEX.index_of(text.slice(i + 1, i + 2))
+        if high < 0 or low < 0 {
+            return out
+        }
+        out.push(high * 16 + low)
+        i = i + 2
+    }
+    return out
+}
+
+// Constant-time comparison for two hex strings of the same length.
+export fn crypto_same_secret(left, right) {
+    if len(left) != len(right) {
+        return false
+    }
+    var diff = 0
+    var i = 0
+    while i < len(left) {
+        if left.slice(i, i + 1) != right.slice(i, i + 1) {
+            diff = diff + 1
+        }
+        i = i + 1
+    }
+    return diff == 0
+}
+
+export fn crypto_token(bytes) {
+    return crypto_random_hex(bytes)
+}

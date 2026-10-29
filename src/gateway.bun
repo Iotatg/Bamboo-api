@@ -1,0 +1,658 @@
+// src/gateway.bun — the /v1 surface.
+//
+//   GET  /v1/models
+//   POST /v1/chat/completions     OpenAI chat
+//   POST /v1/messages             Anthropic messages
+//   POST /v1/responses            OpenAI responses
+//   GET  /v1/balance              wallet
+//   GET  /v1/usage                recent usage
+//   GET  /v1/rpm                  the rate limit on this account
+//
+// Every call authenticates a key, checks the limit, resolves the model,
+// forwards it upstream, and writes the charge to the ledger.
+
+import { http_reason, http_listen, http_serve_forever, http_json, http_html, http_text, http_redirect, http_stream_response } from "./http.bun"
+import { store_data, store_save, store_mutate, store_all, store_find, store_where, store_by_id, store_insert, store_remove, store_setting, store_set_setting, store_trim_usage } from "./store.bun"
+import { auth_api_key, auth_authenticate, auth_cookies, auth_create_session, auth_destroy_session, auth_session_user, auth_session_admin, auth_register, auth_login, auth_login_admin, auth_USER_COOKIE, auth_ADMIN_COOKIE } from "./auth.bun"
+import { billing_price_from_dollars, billing_dollars_from_price, billing_charge, billing_reserve, billing_format_usd, billing_format_price, billing_format_tokens } from "./billing.bun"
+import { limit_consume, limit_headers, limit_client_address } from "./limit.bun"
+import { upstream_split_url, upstream_url_for, upstream_post_json, upstream_get_json, upstream_open_stream, upstream_pump, upstream_post_stream } from "./upstream.bun"
+import { anthropic_messages_to_chat, anthropic_tools_to_openai, anthropic_tool_choice_to_openai, anthropic_to_chat_request, anthropic_from_chat_response, anthropic_stream_mapper } from "./transform/anthropic.bun"
+import { responses_to_chat_request, responses_from_chat_response, responses_stream_mapper } from "./transform/responses.bun"
+import { router_create, router_add, router_get, router_post, router_patch, router_delete_route, router_match } from "./router.bun"
+import { CONFIG } from "./config.bun"
+
+fn error_body(message, kind, code) {
+    return {
+        "error": {
+            "message": message,
+            "type": kind,
+            "param": null,
+            "code": code
+        }
+    }
+}
+
+fn fail(status, message, kind, code) {
+    return http_json(status, error_body(message, kind, code))
+}
+
+fn with_headers(response, extra) {
+    if extra == null {
+        return response
+    }
+    for key in extra.keys() {
+        response["headers"][key] = extra.get(key)
+    }
+    return response
+}
+
+export fn gateway_resolve_model(public_id) {
+    var model = store_find("models", fn (item) {
+        return item["id"] == public_id
+    })
+    if model != null {
+        return model
+    }
+    if public_id.ends_with("-free") {
+        let candidate = "free/" + public_id.slice(0, len(public_id) - 5)
+        model = store_find("models", fn (item) {
+            return item["id"] == candidate
+        })
+        if model != null {
+            return model
+        }
+    }
+    if public_id.starts_with("free-") {
+        let candidate = "free/" + public_id.slice(5, len(public_id))
+        model = store_find("models", fn (item) {
+            return item["id"] == candidate
+        })
+        if model != null {
+            return model
+        }
+    }
+    var swapped = public_id.replace("/", "-")
+    model = store_find("models", fn (item) {
+        return item["id"] == swapped
+    })
+    if model != null {
+        return model
+    }
+    swapped = public_id.replace("-", "/")
+    return store_find("models", fn (item) {
+        return item["id"] == swapped
+    })
+}
+
+fn prices(model) {
+    if model["provider"] == "free" or model["id"].starts_with("free/") {
+        return { "input": 0, "output": 0 }
+    }
+    return { "input": model["input_price_micros"], "output": model["output_price_micros"] }
+}
+
+fn reset_free_pool(user) {
+    if user["free_reset_at"] > now() {
+        return null
+    }
+    store_mutate(fn (doc) {
+        user["free_tokens"] = CONFIG["free_monthly_tokens"]
+        user["free_reset_at"] = now() + 30 * 86400
+        return null
+    })
+    return null
+}
+
+// Authenticate, apply the RPM window, and refresh the monthly free pool.
+fn guard(req) {
+    let session = auth_authenticate(req)
+    if !session["ok"] {
+        return {
+            "ok": false,
+            "response": fail(session["status"], session["message"], "authentication_error", "invalid_api_key")
+        }
+    }
+    let user = session["user"]
+    let key = session["key"]
+    reset_free_pool(user)
+    var rpm = user["rpm_limit"]
+    if rpm <= 0 {
+        rpm = CONFIG["default_rpm"]
+    }
+    let result = limit_consume("key:" + key["id"], rpm, 60)
+    if !result["ok"] {
+        let response = fail(429, "Rate limit reached: " + str(rpm) + " requests per minute on this key. Retry in " + str(result["retry_after"]) + "s.", "rate_limit_error", "rate_limit_exceeded")
+        return { "ok": false, "response": with_headers(response, limit_headers(result)) }
+    }
+    return { "ok": true, "user": user, "key": key, "headers": limit_headers(result) }
+}
+
+fn estimate_input_tokens(body) {
+    var text = ""
+    if body.has("messages") {
+        for message in body["messages"] {
+            if type_of(message) == "dict" and message.has("content") {
+                let content = message["content"]
+                if type_of(content) == "string" {
+                    text = text + content
+                } else if type_of(content) == "list" {
+                    for part in content {
+                        if type_of(part) == "dict" and part.has("text") {
+                            text = text + str(part["text"])
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if body.has("input") {
+        if type_of(body["input"]) == "string" {
+            text = text + body["input"]
+        }
+    }
+    return int(len(text) / 4) + 8
+}
+
+fn max_output_tokens(body) {
+    if body.has("max_tokens") and body["max_tokens"] != null {
+        return int(body["max_tokens"])
+    }
+    if body.has("max_completion_tokens") and body["max_completion_tokens"] != null {
+        return int(body["max_completion_tokens"])
+    }
+    if body.has("max_output_tokens") and body["max_output_tokens"] != null {
+        return int(body["max_output_tokens"])
+    }
+    return 1024
+}
+
+// Can this account pay for the request at all?
+fn affordable(user, key, model, input_tokens, output_tokens) {
+    let price = prices(model)
+    if price["input"] == 0 and price["output"] == 0 {
+        return user["free_tokens"] > 0
+    }
+    if user["balance_micros"] <= 0 {
+        return false
+    }
+    if key["spend_limit_micros"] > 0 and key["spent_micros"] >= key["spend_limit_micros"] {
+        return false
+    }
+    return true
+}
+
+fn settle(user, key, model, input_tokens, output_tokens, latency_ms, status, endpoint) {
+    let price = prices(model)
+    let cost = billing_charge(input_tokens, output_tokens, price["input"], price["output"])
+    var free_units = 0
+    if price["input"] == 0 and price["output"] == 0 {
+        free_units = input_tokens + output_tokens
+    }
+    store_mutate(fn (doc) {
+        if cost > 0 {
+            user["balance_micros"] = user["balance_micros"] - cost
+            key["spent_micros"] = key["spent_micros"] + cost
+            doc["ledger"].push({
+                "id": "led_" + str(int(now() * 1000)) + "_" + str(int(random() * 10000)),
+                "user_id": user["id"],
+                "type": "usage",
+                "amount_micros": 0 - cost,
+                "note": str(model["id"]) + " · " + str(input_tokens) + " in / " + str(output_tokens) + " out",
+                "created_at": int(now())
+            })
+        }
+        if free_units > 0 {
+            user["free_tokens"] = user["free_tokens"] - free_units
+            if user["free_tokens"] < 0 {
+                user["free_tokens"] = 0
+            }
+        }
+        user["last_seen_at"] = now()
+        key["last_used_at"] = now()
+        doc["usage"].push({
+            "id": "use_" + str(int(now() * 1000)) + "_" + str(int(random() * 10000)),
+            "user_id": user["id"],
+            "key_id": key["id"],
+            "model": model["id"],
+            "provider": model["provider"],
+            "endpoint": endpoint,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_micros": cost,
+            "latency_ms": latency_ms,
+            "status": status,
+            "created_at": int(now())
+        })
+        if len(doc["usage"]) > 20000 {
+            doc["usage"] = doc["usage"].slice(len(doc["usage"]) - 20000, len(doc["usage"]))
+        }
+        return null
+    })
+    return cost
+}
+
+fn read_json(req) {
+    if req["body"] == null or req["body"] == "" {
+        return { "ok": true, "value": {} }
+    }
+    try {
+        let value = json_parse(req["body"])
+        if type_of(value) != "dict" {
+            return { "ok": false, "message": "The request body must be a JSON object." }
+        }
+        return { "ok": true, "value": value }
+    } catch err {
+        return { "ok": false, "message": "The request body is not valid JSON: " + str(err) }
+    }
+}
+
+fn sse_headers() {
+    return {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+export fn gateway_register(router) {
+    router_get(router, "/v1/models", handle_models)
+    router_get(router, "/v1/models/:id", handle_model)
+    router_post(router, "/v1/chat/completions", handle_chat)
+    router_post(router, "/v1/messages", handle_messages)
+    router_post(router, "/v1/responses", handle_responses)
+    router_get(router, "/v1/balance", handle_balance)
+    router_get(router, "/v1/usage", handle_usage)
+    router_get(router, "/v1/rpm", handle_rpm)
+    return null
+}
+
+fn public_model(model) {
+    let price = prices(model)
+    return {
+        "id": model["id"],
+        "object": "model",
+        "created": int(model["created_at"]),
+        "owned_by": model["provider"],
+        "name": model["name"],
+        "context_window": model["context_window"],
+        "pricing": {
+            "input_per_million": billing_dollars_from_price(price["input"]),
+            "output_per_million": billing_dollars_from_price(price["output"]),
+            "display": billing_format_price(price["input"]) + " in / " + billing_format_price(price["output"]) + " out"
+        }
+    }
+}
+
+fn handle_models(req) {
+    let session = auth_authenticate(req)
+    if !session["ok"] {
+        return fail(session["status"], session["message"], "authentication_error", "invalid_api_key")
+    }
+    let data = []
+    for model in store_where("models", fn (item) {
+        return item["status"] == "active"
+    }) {
+        data.push(public_model(model))
+    }
+    return http_json(200, { "object": "list", "data": data })
+}
+
+fn handle_model(req) {
+    let session = auth_authenticate(req)
+    if !session["ok"] {
+        return fail(session["status"], session["message"], "authentication_error", "invalid_api_key")
+    }
+    let model = gateway_resolve_model(req["params"]["id"])
+    if model == null {
+        return fail(404, "No model named '" + str(req["params"]["id"]) + "'.", "invalid_request_error", "model_not_found")
+    }
+    return http_json(200, public_model(model))
+}
+
+fn handle_chat(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let parsed = read_json(req)
+    if !parsed["ok"] {
+        return fail(400, parsed["message"], "invalid_request_error", "invalid_json")
+    }
+    let body = parsed["value"]
+    if !body.has("model") {
+        return fail(400, "Add a 'model' to the request.", "invalid_request_error", "model_required")
+    }
+    let model = gateway_resolve_model(str(body["model"]))
+    if model == null {
+        return fail(404, "No model named '" + str(body["model"]) + "'. Call GET /v1/models for the catalogue.", "invalid_request_error", "model_not_found")
+    }
+    let input_estimate = estimate_input_tokens(body)
+    if !affordable(gate["user"], gate["key"], model, input_estimate, max_output_tokens(body)) {
+        return fail(402, "This request cannot be paid for. Top up the wallet, or use a free model while the monthly allowance lasts.", "insufficient_quota", "insufficient_balance")
+    }
+
+    let payload = {}
+    for key in body.keys() {
+        payload[key] = body.get(key)
+    }
+    payload["model"] = model["upstream_id"]
+    let started = now()
+    let price = prices(model)
+
+    if body.has("stream") and body["stream"] == true {
+        payload["stream"] = true
+        payload["stream_options"] = { "include_usage": true }
+        let handle = upstream_open_stream("/chat/completions", payload, null)
+        if !handle["ok"] {
+            var status = handle["status"]
+            if status < 400 {
+                status = 502
+            }
+            return fail(status, "Upstream refused the request: " + str(handle["error"]), "upstream_error", "upstream_failed")
+        }
+        return http_stream_response(200, sse_headers(), fn (write) {
+            var input_tokens = input_estimate
+            var output_tokens = 0
+            var failed = false
+            var pending = ""
+            upstream_pump(handle, fn (line) {
+                pending = pending + line + "\n"
+                if line == "" {
+                    write(pending)
+                    pending = ""
+                }
+                if line.starts_with("data: ") {
+                    let data = line.slice(6, len(line)).trim()
+                    if data != "[DONE]" and data != "" {
+                        try {
+                            let chunk = json_parse(data)
+                            if chunk.has("usage") and chunk["usage"] != null {
+                                if chunk["usage"].has("prompt_tokens") {
+                                    input_tokens = chunk["usage"]["prompt_tokens"]
+                                }
+                                if chunk["usage"].has("completion_tokens") {
+                                    output_tokens = chunk["usage"]["completion_tokens"]
+                                }
+                            }
+                        } catch err {
+                            failed = true
+                        }
+                    }
+                }
+            })
+            if pending != "" {
+                write(pending)
+            }
+            let elapsed = int((now() - started) * 1000)
+            settle(gate["user"], gate["key"], model, input_tokens, output_tokens, elapsed, "ok", "/v1/chat/completions")
+        })
+    }
+
+    let result = upstream_post_json("/chat/completions", payload, null)
+    let elapsed = int((now() - started) * 1000)
+    if !result["ok"] {
+        settle(gate["user"], gate["key"], model, 0, 0, elapsed, "error", "/v1/chat/completions")
+        return fail(502, "The upstream could not be reached: " + str(result["body"]), "upstream_error", "upstream_unreachable")
+    }
+    if result["status"] < 200 or result["status"] >= 300 {
+        return fail(result["status"], str(result["body"]), "upstream_error", "upstream_rejected")
+    }
+    var data = {}
+    try {
+        data = json_parse(result["body"])
+    } catch err {
+        return fail(502, "The upstream answered with something that is not JSON.", "upstream_error", "bad_upstream_body")
+    }
+    var input_tokens = input_estimate
+    var output_tokens = 0
+    if data.has("usage") and data["usage"] != null {
+        if data["usage"].has("prompt_tokens") {
+            input_tokens = data["usage"]["prompt_tokens"]
+        }
+        if data["usage"].has("completion_tokens") {
+            output_tokens = data["usage"]["completion_tokens"]
+        }
+    }
+    let cost = settle(gate["user"], gate["key"], model, input_tokens, output_tokens, elapsed, "ok", "/v1/chat/completions")
+    if data.has("usage") and data["usage"] != null {
+        data["usage"]["cost_usd"] = billing_dollars_from_price(cost)
+    }
+    return with_headers(http_json(200, data), gate["headers"])
+}
+
+fn handle_messages(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let parsed = read_json(req)
+    if !parsed["ok"] {
+        return fail(400, parsed["message"], "invalid_request_error", "invalid_json")
+    }
+    let body = parsed["value"]
+    if !body.has("model") {
+        return fail(400, "Add a 'model' to the request.", "invalid_request_error", "model_required")
+    }
+    let model = gateway_resolve_model(str(body["model"]))
+    if model == null {
+        return fail(404, "No model named '" + str(body["model"]) + "'.", "invalid_request_error", "model_not_found")
+    }
+    let input_estimate = estimate_input_tokens(body)
+    if !affordable(gate["user"], gate["key"], model, input_estimate, max_output_tokens(body)) {
+        return fail(402, "This request cannot be paid for. Top up the wallet, or use a free model while the monthly allowance lasts.", "insufficient_quota", "insufficient_balance")
+    }
+    let payload = anthropic_to_chat_request(body, model["upstream_id"])
+    let started = now()
+
+    if payload["stream"] == true {
+        let handle = upstream_open_stream("/chat/completions", payload, null)
+        if !handle["ok"] {
+            var status = handle["status"]
+            if status < 400 {
+                status = 502
+            }
+            return fail(status, "Upstream refused the request: " + str(handle["error"]), "upstream_error", "upstream_failed")
+        }
+        return http_stream_response(200, sse_headers(), fn (write) {
+            let mapper = anthropic_stream_mapper(str(body["model"]), input_estimate)
+            upstream_pump(handle, fn (line) {
+                if line.starts_with("data: ") {
+                    let data = line.slice(6, len(line)).trim()
+                    if data != "[DONE]" and data != "" {
+                        try {
+                            let chunk = json_parse(data)
+                            let out = mapper["feed"](chunk)
+                            if out != "" {
+                                write(out)
+                            }
+                        } catch err {
+                            print("[gateway] bad chunk: " + str(err))
+                        }
+                    }
+                }
+            })
+            write(mapper["finish"]())
+            let usage = mapper["usage"]()
+            let elapsed = int((now() - started) * 1000)
+            settle(gate["user"], gate["key"], model, usage["input_tokens"], usage["output_tokens"], elapsed, "ok", "/v1/messages")
+        })
+    }
+
+    let result = upstream_post_json("/chat/completions", payload, null)
+    let elapsed = int((now() - started) * 1000)
+    if !result["ok"] {
+        settle(gate["user"], gate["key"], model, 0, 0, elapsed, "error", "/v1/messages")
+        return fail(502, "The upstream could not be reached: " + str(result["body"]), "upstream_error", "upstream_unreachable")
+    }
+    if result["status"] < 200 or result["status"] >= 300 {
+        return fail(result["status"], str(result["body"]), "upstream_error", "upstream_rejected")
+    }
+    var data = {}
+    try {
+        data = json_parse(result["body"])
+    } catch err {
+        return fail(502, "The upstream answered with something that is not JSON.", "upstream_error", "bad_upstream_body")
+    }
+    let message = anthropic_from_chat_response(data, str(body["model"]))
+    let cost = settle(gate["user"], gate["key"], model, message["usage"]["input_tokens"], message["usage"]["output_tokens"], elapsed, "ok", "/v1/messages")
+    message["usage"]["cost_usd"] = billing_dollars_from_price(cost)
+    return with_headers(http_json(200, message), gate["headers"])
+}
+
+fn handle_responses(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let parsed = read_json(req)
+    if !parsed["ok"] {
+        return fail(400, parsed["message"], "invalid_request_error", "invalid_json")
+    }
+    let body = parsed["value"]
+    if !body.has("model") {
+        return fail(400, "Add a 'model' to the request.", "invalid_request_error", "model_required")
+    }
+    let model = gateway_resolve_model(str(body["model"]))
+    if model == null {
+        return fail(404, "No model named '" + str(body["model"]) + "'.", "invalid_request_error", "model_not_found")
+    }
+    let input_estimate = estimate_input_tokens(body)
+    if !affordable(gate["user"], gate["key"], model, input_estimate, max_output_tokens(body)) {
+        return fail(402, "This request cannot be paid for. Top up the wallet, or use a free model while the monthly allowance lasts.", "insufficient_quota", "insufficient_balance")
+    }
+    let payload = responses_to_chat_request(body, model["upstream_id"])
+    let started = now()
+
+    if payload["stream"] == true {
+        let handle = upstream_open_stream("/chat/completions", payload, null)
+        if !handle["ok"] {
+            var status = handle["status"]
+            if status < 400 {
+                status = 502
+            }
+            return fail(status, "Upstream refused the request: " + str(handle["error"]), "upstream_error", "upstream_failed")
+        }
+        return http_stream_response(200, sse_headers(), fn (write) {
+            let mapper = responses_stream_mapper(str(body["model"]), input_estimate)
+            upstream_pump(handle, fn (line) {
+                if line.starts_with("data: ") {
+                    let data = line.slice(6, len(line)).trim()
+                    if data != "[DONE]" and data != "" {
+                        try {
+                            let chunk = json_parse(data)
+                            let out = mapper["feed"](chunk)
+                            if out != "" {
+                                write(out)
+                            }
+                        } catch err {
+                            print("[gateway] bad chunk: " + str(err))
+                        }
+                    }
+                }
+            })
+            write(mapper["finish"]())
+            let usage = mapper["usage"]()
+            let elapsed = int((now() - started) * 1000)
+            settle(gate["user"], gate["key"], model, usage["input_tokens"], usage["output_tokens"], elapsed, "ok", "/v1/responses")
+        })
+    }
+
+    let result = upstream_post_json("/chat/completions", payload, null)
+    let elapsed = int((now() - started) * 1000)
+    if !result["ok"] {
+        settle(gate["user"], gate["key"], model, 0, 0, elapsed, "error", "/v1/responses")
+        return fail(502, "The upstream could not be reached: " + str(result["body"]), "upstream_error", "upstream_unreachable")
+    }
+    if result["status"] < 200 or result["status"] >= 300 {
+        return fail(result["status"], str(result["body"]), "upstream_error", "upstream_rejected")
+    }
+    var data = {}
+    try {
+        data = json_parse(result["body"])
+    } catch err {
+        return fail(502, "The upstream answered with something that is not JSON.", "upstream_error", "bad_upstream_body")
+    }
+    let response = responses_from_chat_response(data, str(body["model"]))
+    settle(gate["user"], gate["key"], model, response["usage"]["input_tokens"], response["usage"]["output_tokens"], elapsed, "ok", "/v1/responses")
+    return with_headers(http_json(200, response), gate["headers"])
+}
+
+fn handle_balance(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let user = gate["user"]
+    let key = gate["key"]
+    return with_headers(http_json(200, {
+        "object": "balance",
+        "currency": "usd",
+        "balance": billing_dollars_from_price(user["balance_micros"]),
+        "display": billing_format_usd(user["balance_micros"]),
+        "free_tokens_remaining": user["free_tokens"],
+        "free_tokens_reset_at": user["free_reset_at"],
+        "key": {
+            "id": key["id"],
+            "name": key["name"],
+            "prefix": key["prefix"],
+            "spent": billing_dollars_from_price(key["spent_micros"]),
+            "spend_limit": billing_dollars_from_price(key["spend_limit_micros"])
+        }
+    }), gate["headers"])
+}
+
+fn handle_usage(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let user = gate["user"]
+    let rows = store_where("usage", fn (item) {
+        return item["user_id"] == user["id"]
+    })
+    let recent = []
+    var index = len(rows) - 1
+    var count = 0
+    while index >= 0 and count < 50 {
+        recent.push(rows[index])
+        index = index - 1
+        count = count + 1
+    }
+    var tokens = 0
+    var cost = 0
+    for row in rows {
+        tokens = tokens + row["input_tokens"] + row["output_tokens"]
+        cost = cost + row["cost_micros"]
+    }
+    return with_headers(http_json(200, {
+        "object": "usage",
+        "requests": len(rows),
+        "tokens": tokens,
+        "spent_micros": cost,
+        "spent": billing_format_usd(cost),
+        "data": recent
+    }), gate["headers"])
+}
+
+fn handle_rpm(req) {
+    let gate = guard(req)
+    if !gate["ok"] {
+        return gate["response"]
+    }
+    let user = gate["user"]
+    var rpm = user["rpm_limit"]
+    if rpm <= 0 {
+        rpm = CONFIG["default_rpm"]
+    }
+    return with_headers(http_json(200, {
+        "object": "rpm",
+        "limit": rpm,
+        "window_seconds": 60
+    }), gate["headers"])
+}
